@@ -1,6 +1,7 @@
 import toml as hjson
 import time
 import os, logging, subprocess, pprint
+import re
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
@@ -149,6 +150,7 @@ def run(job, options={}):
 
         # Specifies the command that gets executed.
         execute = settings_dict.get('execute', {})
+        
 
         # The name of the file that contain the commands.
         script_name = execute.get("script_name", "recipe.sh")
@@ -163,12 +165,7 @@ def run(job, options={}):
         context = Context(json_data)
         command_template = Template(command)
         command = command_template.render(context)
-
-        # This is the full command that will be executed.
-        full_command = f'(cd {work_dir} && {command})'
-        if show_command:
-            print(full_command)
-            return
+        
 
         # Script template.
         context = Context(json_data)
@@ -191,9 +188,82 @@ def run(job, options={}):
         with open(os.path.join(work_dir, script_name), 'wt') as fp:
             fp.write(script)
 
+
         # Create a file that stores the json data for reference.
         with open(json_fname, 'wt') as fp:
             fp.write(hjson.dumps(json_data))
+
+        #####################
+
+        #check for wdl
+        proc = subprocess.run('cat recipe.sh >../../../../scrip.txt',cwd=work_dir, shell=True,
+                              stdout=open(stdout_fname, "w"),
+                              stderr=open(stderr_fname, "w"))
+          
+
+
+        proc = subprocess.run("java -jar "+work_dir+"/../../projects/project-1/data-2/womtool-54.jar validate scrip.txt > op.txt", shell=True,
+                              stdout=open(stdout_fname, "w"),
+                              stderr=open(stderr_fname, "w"))
+        
+        f=open('op.txt','r')
+        str1=f.readline()
+        print(str1)
+        f.close()
+        #remove the trailing newline
+        str1 = str1.rstrip("\n")
+
+        if(str1=="Success!"):
+            command="java -jar "+work_dir+"/../../projects/project-1/data-1/cromwell-55.jar run "+script_name
+        
+        #check for cwl
+            
+        proc = subprocess.run( 'cwltool --validate scrip.txt 1>op.txt', shell=True,
+                              stdout=open(stdout_fname, "w"),
+                              stderr=open(stderr_fname, "w"))
+        f=open('op.txt','r')
+        str1=f.readline()
+        f.close()
+        #remove the trailing newline
+        str1 = str1.rstrip("\n")
+
+        if(str1=="scrip.txt is valid CWL."):
+            
+
+
+            #get the input job file location
+            proc = subprocess.run( 'find -L `pwd` -type f -name "*" ! -name "recipe.sh" ! -name "stdout.txt" ! -name "input.json" ! -name "stderr.txt" >../../../../list.txt',cwd=work_dir, shell=True,
+                                    stdout=open(stdout_fname, "w"),
+                                    stderr=open(stderr_fname, "w"))
+
+            f=open('list.txt','r')
+            str1=f.readline()
+            str1 = str1.rstrip("\n")
+          
+            print(str1)
+            f=open('jobfile','w+')
+            f.close()
+            #get the input job file contents
+            proc = subprocess.run( 'cat '+str1+' > jobfile', shell=True,
+                                    stdout=open(stdout_fname, "w"),
+                                    stderr=open(stderr_fname, "w"))
+
+            #ACTUAL COMMAND TO BE EXECUTED
+            command='cwltool recipe.sh ../../../../jobfile'
+            #command= 'echo " Dummy command because I cant execute cwl in my laptop"'
+        
+        
+
+        ################################
+
+        # This is the full command that will be executed.
+        
+        full_command = f'(cd {work_dir} && {command})'
+        
+        if show_command:
+            print(full_command)
+            return
+                
 
         # Show the command that is executed.
         logger.info(f'Job id={job.id} executing: {full_command}')
@@ -206,6 +276,7 @@ def run(job, options={}):
         Job.objects.filter(pk=job.pk).update(state=Job.RUNNING,
                                              start_date=timezone.now(),
                                              script=script)
+
         # Run the command.
         proc = subprocess.run(command, cwd=work_dir, shell=True,
                               stdout=open(stdout_fname, "w"),
