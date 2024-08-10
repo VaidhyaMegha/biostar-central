@@ -39,7 +39,7 @@ REQUIRED_TAGS_URL = "/"
 
 # How to run tasks in the background.
 # Valid options; block, disable, threaded, uwsgi, celery.
-TASK_RUNNER = 'block'
+TASK_RUNNER = 'threaded'
 
 # Threshold to classify spam
 SPAM_THRESHOLD = .5
@@ -78,10 +78,13 @@ REPLIES_FEED_COUNT = 15
 
 SIMILAR_FEED_COUNT = 30
 
-SESSION_UPDATE_SECONDS = 60
+SESSION_UPDATE_SECONDS = 10
 
 # Maximum number of awards every SESSION_UPDATE_SECONDS.
 MAX_AWARDS = 2
+
+# How many stories to show
+HERALD_LIST_COUNT = 100
 
 # Search index name
 INDEX_NAME = os.environ.setdefault("INDEX_NAME", "index")
@@ -152,12 +155,16 @@ DATA_MIGRATION = False
 # Default cache
 CACHES = {
     'default': {
-        #'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
+        #'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
         'LOCATION': 'unique-snowflake',
     }
 }
 
+# Strict rules applied to post tags
+STRICT_TAGS = True
+
+DROPDOWN_TAGS = False
 TASK_MODULES = ("biostar.forum.tasks", )
 
 # Enable debug toolbar specific functions
@@ -166,5 +173,26 @@ if DEBUG_TOOLBAR:
         'debug_toolbar',
     ])
     MIDDLEWARE.append('debug_toolbar.middleware.DebugToolbarMiddleware')
+
+
+# Words when present in the content get you banned.
+BANNED_WORDS_CONTENT = r"""
+\bcialis
+\bviagra
+\bmoney
+\bloan
+\bcustomer
+\bcash 
+"""
+
+# Words, that when present in the title get you banned.
+BANNED_WORDS_TITLE  = r"""
+\bcash
+\bmoney
+\bloan
+\d{6,}
+http 
+https
+"""
 
 

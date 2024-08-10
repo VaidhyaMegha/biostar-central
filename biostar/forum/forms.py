@@ -1,5 +1,6 @@
 from pagedown.widgets import PagedownWidget
 import os
+import re
 import langdetect
 from django import forms
 from django.utils.safestring import mark_safe
@@ -8,9 +9,10 @@ from django.shortcuts import reverse
 from django.conf import settings
 from snowpenguin.django.recaptcha2.fields import ReCaptchaField
 from snowpenguin.django.recaptcha2.widgets import ReCaptchaWidget
-from biostar.accounts.models import User
-from .models import Post
-from biostar.forum import models, auth
+from biostar.accounts.models import User, Profile
+from biostar.accounts.forms import get_tags_widget
+from .models import Post, SharedLink
+from biostar.forum import models, auth, util
 
 from .const import *
 
@@ -22,6 +24,12 @@ MAX_CONTENT = 15000
 MIN_CONTENT = 5
 MAX_TITLE = 400
 MAX_TAGS = 5
+MAX_TAG_LEN = 200
+
+
+def log_edits(user, post):
+    if user != post.author:
+        auth.db_logger(user=user, text=f'edited post', target=post.author, post=post)
 
 
 def valid_language(text):
@@ -59,8 +67,26 @@ def valid_tag(text):
     "Validates form input for tags"
 
     words = text.split(",")
+
     if len(words) > MAX_TAGS:
         raise ValidationError('You have too many tags (5 allowed)')
+
+    words = text.split()
+
+    if len(words) > MAX_TAGS:
+        raise ValidationError('You have too many tags (5 allowed)')
+
+MAX_ORD = 383
+
+# Additional valid characters
+VALID_ORDS = list(range(1, MAX_ORD)) + list(range(8208, 8255))
+VALID_ORDS = set(VALID_ORDS)
+
+def validate_ascii(value):
+    
+    for c in value:
+        if ord(c) not in VALID_ORDS:
+            raise ValidationError(f"Only ASCII characters are allowed. Invalid character {c}, ({ord(c)})")
 
 
 def informative_choices(choices):
@@ -110,7 +136,7 @@ def required_tags(lst):
 
 
 class PostLongForm(forms.Form):
-    choices = [opt for opt in Post.TYPE_CHOICES if opt[0] in Post.TOP_LEVEL]
+    choices = [opt for opt in Post.TYPE_CHOICES if opt[0] in Post.TOP_LEVEL and opt[0] != Post.HERALD]
 
     if settings.ALLOWED_POST_TYPES:
         choices = [opt for opt in choices if opt[1] in settings.ALLOWED_POST_TYPES]
@@ -121,16 +147,16 @@ class PostLongForm(forms.Form):
                                    widget=forms.Select(choices=choices, attrs={'class': "ui dropdown"}),
                                    help_text="Select a post type.")
     title = forms.CharField(label="Post Title", max_length=200, min_length=2,
-                            validators=[valid_title],
+                            validators=[valid_title, validate_ascii],
+
                             help_text="Enter a descriptive title to promote better answers.")
-    tag_val = forms.CharField(label="Post Tags", max_length=50, required=True, validators=[valid_tag],
-                              help_text="""
-                              Create a new tag by typing a word then adding a comma or press ENTER or SPACE.
-                              """,
-                              widget=forms.HiddenInput())
+    tag_val = forms.CharField(label="Post Tags", max_length=MAX_TAG_LEN, required=True, validators=[valid_tag],
+
+                              widget=get_tags_widget(attrs={'id': 'tag_val'}),
+                              help_text="""Create a new tag by typing a word then adding a comma.""")
 
     content = forms.CharField(widget=forms.Textarea,
-                              validators=[valid_language],
+                              validators=[valid_language, validate_ascii],
                               min_length=MIN_CONTENT, max_length=MAX_CONTENT, label="Post Content", strip=False)
 
     def __init__(self, post=None, user=None, *args, **kwargs):
@@ -145,10 +171,16 @@ class PostLongForm(forms.Form):
         if self.user != self.post.author and not self.user.profile.is_moderator:
             raise forms.ValidationError("Only the author or a moderator can edit a post.")
         data = self.cleaned_data
+
         self.post.title = data.get('title')
-        self.post.content = data.get("content")
+        content = data.get('content', self.post.content)
+
+        log_edits(user=self.user, post=self.post)
+        self.post.content = content
+
         self.post.type = data.get('post_type')
         self.post.tag_val = data.get('tag_val')
+        self.post.lastedit_date = util.now()
         self.post.lastedit_user = self.user
         self.post.save()
         return self.post
@@ -157,36 +189,86 @@ class PostLongForm(forms.Form):
         """
         Take out duplicates
         """
-        tag_val = self.cleaned_data["tag_val"] or 'tag1,tag2'
-        tags = set([x for x in tag_val.split(",") if x])
-        required_tags(tags)
+        if settings.STRICT_TAGS:
+            pattern = r'^[A-Za-z0-9-._]+$'
+            tag_val = self.cleaned_data["tag_val"]
+            tag_val = tag_val.replace(',', ' ').split()
 
-        return ",".join(tags)
+            for tag in tag_val:
+                match = re.match(pattern, tag)
+                if not match:
+                    raise forms.ValidationError(f'Invalid characters in tag: {tag}')
+        else:
+            tag_val = self.cleaned_data["tag_val"].split(',')
+
+        tags = set(tag_val)
+        required_tags(tags)
+        tags = ",".join(tags)
+
+        return tags
 
     def clean_content(self):
         content = self.cleaned_data["content"]
         length = len(content.replace(" ", ""))
+
+        spam_check(content, user=self.user, target=settings.BANNED_WORDS_CONTENT)
 
         if length < MIN_CHARS:
             raise forms.ValidationError(f"Too short, place add more than {MIN_CHARS}")
 
         return content
 
+    def clean_title(self):
+        title = self.cleaned_data["title"]
+        spam_check(title, user=self.user, target=settings.BANNED_WORDS_TITLE)
+        return title
+
+def spam_check(value, target, user):
+    words = target.split()
+    content = " ".join(value.split())
+    content = content.replace("-", " ")
+    content = content.replace("_", " ")
+    for patt in words:
+        patt = r'%s' % patt
+        if re.search(patt, content, flags=re.IGNORECASE):
+            suspend_user(user)
+
+from biostar.utils import helpers
+
+def suspend_user(user):
+
+    # This can be turned on if we want to be stricter
+    if user.profile.trusted:
+        #auth.db_logger(user=user, target=user, text=f'NOT insta banned because trusted')
+        #raise forms.ValidationError("Spam words by trusted user.")
+        return
+
+    if user.profile.state == Profile.NEW:
+        user.profile.state = Profile.SUSPENDED
+        user.profile.save()
+        admin = User.objects.filter(is_superuser=True).order_by("pk").first()
+        auth.db_logger(user=admin, target=user, text=f'insta banned')
+        raise forms.ValidationError(f"This account has been suspended")
+
+    #raise forms.ValidationError("Spam words detected in the content")
+    return
 
 class PostShortForm(forms.Form):
     MIN_LEN, MAX_LEN = 10, 10000
-    parent_uid = forms.CharField(widget=forms.HiddenInput(), min_length=2, max_length=32)
-    content = forms.CharField(widget=forms.Textarea,
-                              min_length=MIN_LEN, max_length=MAX_LEN, strip=False)
 
-    def __init__(self, user=None, post=None, recaptcha=True, *args, **kwargs):
+    content = forms.CharField(widget=forms.Textarea, min_length=MIN_LEN, max_length=MAX_LEN, strip=False,
+                              validators=[valid_language, validate_ascii],)
+
+    def __init__(self, post, user=None, request=None, ptype=Post.COMMENT, *args, **kwargs):
         self.user = user
         self.post = post
+        self.ptype = ptype
         super().__init__(*args, **kwargs)
         self.fields['content'].strip = False
 
     def clean_content(self):
         content = self.cleaned_data["content"]
+        spam_check(content, user=self.user, target=settings.BANNED_WORDS_CONTENT)
         return content
 
     def clean(self):
@@ -195,41 +277,61 @@ class PostShortForm(forms.Form):
             raise forms.ValidationError("You need to be logged in.")
         return cleaned_data
 
+    def edit(self):
+        # Set the fields for this post.
+        self.post.lastedit_user = self.user
+        self.post.lastedit_date = util.now()
+        content = self.cleaned_data.get('content', self.post.content)
+        log_edits(user=self.user, post=self.post)
+        self.post.content = content
+        self.post.save()
 
-class PostModForm(forms.Form):
+    def save(self):
+        content = self.cleaned_data.get('content', self.post.content)
+        post = auth.create_post(parent=self.post, author=self.user, content=content, ptype=self.ptype,
+                                root=self.post.root, title=self.post.title)
+        return post
 
-    def __init__(self, post, request, user, *args, **kwargs):
-        self.post = post
+
+class MergeProfiles(forms.Form):
+    main = forms.CharField(label='Main user email', max_length=100, required=True)
+    alias = forms.CharField(label='Alias email to merge to main', max_length=100, required=True)
+
+    def __init__(self, user=None, *args, **kwargs):
         self.user = user
-        self.request = request
-
-        super(PostModForm, self).__init__(*args, **kwargs)
-
-        choices = [
-            (DELETE, "Delete post"),
-            (OPEN_POST, "Open post"),
-        ]
-
-        # Top level posts may be bumped.
-        if post.is_toplevel:
-            choices += [(BUMP_POST, "Bump post")]
-        elif post.is_comment:
-            choices += [(MOVE_ANSWER, "Move to answer")]
-
-        if post.is_answer or post.is_comment:
-            choices += [(MOVE_COMMENT, "Move to comment")]
-
-        # Punitive options.
-        choices.extend((
-                (OFF_TOPIC, "Mark as offtopic"),
-                (REPORT_SPAM, "Mark as spam (suspend author)"),
-        ))
-
-        self.fields['action'] = forms.IntegerField(widget=forms.RadioSelect(choices=choices), required=True)
+        super().__init__(*args, **kwargs)
 
     def clean(self):
+        cleaned_data = super(MergeProfiles, self).clean()
+        alias = cleaned_data['alias']
+        main = cleaned_data['main']
 
-        if not self.user.profile.is_moderator:
-            raise forms.ValidationError("You need to be a moderator to preform that action.")
+        to_delete = User.objects.filter(email=alias).first()
+        merge_to = User.objects.filter(email=main).first()
 
-        return self.cleaned_data
+        if self.user and not (self.user.is_staff or self.user.is_superuser):
+            raise forms.ValidationError(f'Only staff member can perform this action.')
+
+        if not to_delete:
+            raise forms.ValidationError(f'{alias} email does not exist.')
+
+        if not merge_to:
+            raise forms.ValidationError(f'{main} email does not exist.')
+
+        if main == alias:
+            raise forms.ValidationError('Main and alias profiles are the same.')
+
+        return cleaned_data
+
+    def save(self):
+
+        alias = self.cleaned_data['alias']
+        main = self.cleaned_data['main']
+
+        main = User.objects.filter(email=main).first()
+        alias = User.objects.filter(email=alias).first()
+
+        # Merge the two accounts.
+        auth.merge_profiles(main=main, alias=alias)
+
+        return main
